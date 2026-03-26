@@ -37,7 +37,7 @@ DOI:
 (leave blank)
 
 LICENSE:
-CC BY 4.0
+CC BY 4.0  (closest to MIT that arXiv supports; code repo is MIT)
 
 ═══════════════════════════════════════════════════════════════
   Files to upload:
