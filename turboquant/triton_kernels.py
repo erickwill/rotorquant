@@ -235,14 +235,15 @@ def _rotor_full_fused_kernel(
     o0, o1, o2, o3, o4, o5, o6, o7 = _gp_mv_rotor(
         t0, t1, t2, t3, t4, t5, t6, t7, r_s, -r_p12, -r_p13, -r_p23)
 
-    # Grade-aware quantization (nearest centroid)
-    q0 = _quantize_nearest(o0, c_scalar_ptr, n_scalar)
+    # Grade-aware quantization — only non-zero grades (vector + trivector)
+    # Scalar (o0) and bivector (o4,o5,o6) are always zero after sandwich of grade-1 input
+    q0 = z  # scalar: always zero
     q1 = _quantize_nearest(o1, c_vector_ptr, n_vector)
     q2 = _quantize_nearest(o2, c_vector_ptr, n_vector)
     q3 = _quantize_nearest(o3, c_vector_ptr, n_vector)
-    q4 = _quantize_nearest(o4, c_bivector_ptr, n_bivector)
-    q5 = _quantize_nearest(o5, c_bivector_ptr, n_bivector)
-    q6 = _quantize_nearest(o6, c_bivector_ptr, n_bivector)
+    q4 = z  # bivector: always zero
+    q5 = z
+    q6 = z
     q7 = _quantize_nearest(o7, c_trivector_ptr, n_trivector)
 
     # Inverse sandwich: temp2 = R̃ * q, final = temp2 * R
@@ -271,8 +272,8 @@ def triton_rotor_full_fused(
     """Fused RotorQuant pipeline: normalize→embed→rotor→quantize→unrotor→extract→rescale.
 
     Single kernel launch for the full quantize-dequantize roundtrip.
-    Norm separation: normalizes to unit vectors before quantization,
-    then rescales output by original norms.
+    Only quantizes non-zero grades (vector + trivector); scalar and bivector
+    are always zero after sandwich of grade-1 input and are skipped.
     """
     batch_size, emb_dim = input.shape
     n_groups = rotors.shape[0]
@@ -282,9 +283,10 @@ def triton_rotor_full_fused(
     norms = input_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     input_f32 = (input_f32 / norms).contiguous()
     rotors_f32 = rotors.float().contiguous()
-    c_s = c_scalar.float().contiguous()
+    # Scalar/bivector centroids not used (zero grades), but kernel signature needs them
+    c_s = c_scalar.float().contiguous() if c_scalar is not None else c_vector.float().contiguous()
     c_v = c_vector.float().contiguous()
-    c_b = c_bivector.float().contiguous()
+    c_b = c_bivector.float().contiguous() if c_bivector is not None else c_vector.float().contiguous()
     c_t = c_trivector.float().contiguous()
 
     output = torch.empty_like(input_f32)

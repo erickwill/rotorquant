@@ -61,42 +61,34 @@ class RotorQuantMSE(nn.Module):
         self.mv_dim = self.n_groups * MV_DIM  # total components
 
         # Grade-aware bit allocation
+        # Only store non-zero grades: the rotor sandwich R v R̃ of a grade-1
+        # vector produces ONLY odd grades (vector + trivector). Scalar and
+        # bivector are mathematically guaranteed to be zero — don't waste
+        # storage on them. This cuts stored indices from 8/group to 4/group.
         if grade_bits is None:
             grade_bits = {
-                'scalar': bits,
                 'vector': bits,
-                'bivector': bits,
                 'trivector': max(bits - 1, 1),
             }
         self.grade_bits = grade_bits
 
         # Create per-grade codebooks
-        # The rotor sandwich embeds 3 dims into 8 MV components per group.
-        # After rotation, vector-grade components have variance ~1/d_original
-        # scaled by the embedding (3→8 spreading). The effective dimension
-        # that determines the post-rotor Gaussian σ is the ORIGINAL d,
-        # not the MV dimension, because the rotor preserves norms.
-        # Empirically: std ≈ 1/sqrt(d) for vector grades on unit-norm input.
+        # d_eff determines the Lloyd-Max Gaussian σ = 1/√d_eff
         d_eff_vector = d       # vector grades: σ ≈ 1/√d
         d_eff_trivector = max(d // 2, 8)  # trivector: slightly wider distribution
-        d_eff_scalar = d * 4   # scalar grade: very narrow (near-zero for vectors)
         self.codebooks = nn.ModuleDict()
         for grade_name, gb in grade_bits.items():
-            if grade_name == 'scalar':
-                cb = LloydMaxCodebook(d_eff_scalar, gb)
-            elif grade_name == 'trivector':
+            if grade_name == 'trivector':
                 cb = LloydMaxCodebook(d_eff_trivector, gb)
             else:
                 cb = LloydMaxCodebook(d_eff_vector, gb)
             self.register_buffer(f'centroids_{grade_name}',
                                  cb.centroids.to(device))
 
-        # Grade masks for indexing into multivector
+        # Only quantize non-zero grades (vector + trivector)
         # [scalar, e1, e2, e3, e12, e13, e23, e123]
         self.grade_map = {
-            'scalar':   [0],
             'vector':   [1, 2, 3],
-            'bivector': [4, 5, 6],
             'trivector': [7],
         }
 
@@ -162,9 +154,9 @@ class RotorQuantMSE(nn.Module):
 
     def dequantize(self, indices: dict) -> torch.Tensor:
         """Reconstruct vectors from quantized indices."""
-        sample_centroids = getattr(self, 'centroids_scalar')
-        scalar_idx = indices['scalar']
-        flat_batch = scalar_idx.shape[0] if scalar_idx.dim() >= 1 else 1
+        sample_centroids = getattr(self, 'centroids_vector')
+        vector_idx = indices['vector']
+        flat_batch = vector_idx.shape[0] if vector_idx.dim() >= 1 else 1
 
         mv_q = torch.zeros(flat_batch, self.n_groups, MV_DIM,
                            dtype=sample_centroids.dtype,
