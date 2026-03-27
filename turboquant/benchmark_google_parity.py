@@ -98,18 +98,11 @@ def test_perplexity(model, tokenizer, bits_list, n_tokens=512, prefill_len=256):
     text = '\n\n'.join(load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')['text'])
     input_ids = tokenizer(text, return_tensors='pt').input_ids[:, :n_tokens].to('cuda')
 
-    # FP16 baseline (single-pass)
-    out = model(input_ids, use_cache=False)
-    ppl_fp16 = math.exp(F.cross_entropy(
-        out.logits[:, :-1, :].reshape(-1, out.logits.size(-1)),
-        input_ids[:, 1:].reshape(-1)).item())
-    del out; torch.cuda.empty_cache()
-
-    results = [('FP16', ppl_fp16, 0, 0)]
-
-    for bits in bits_list:
-        _patch, _orig, comps, pf_done = make_patcher(bits)
-        DynamicCache.update = _patch
+    def _ar_eval(patch_fn=None, orig_fn=None):
+        """Autoregressive eval: prefill context, score remaining tokens one-by-one."""
+        if patch_fn:
+            from transformers import DynamicCache
+            DynamicCache.update = patch_fn
 
         context = input_ids[:, :prefill_len]
         with torch.no_grad():
@@ -128,11 +121,21 @@ def test_perplexity(model, tokenizer, bits_list, n_tokens=512, prefill_len=256):
             cache = out.past_key_values
             logits = out.logits[:, -1:, :]
 
-        DynamicCache.update = _orig
-        comps.clear(); pf_done.clear()
-        del cache; torch.cuda.empty_cache(); gc.collect()
+        if orig_fn:
+            from transformers import DynamicCache
+            DynamicCache.update = orig_fn
 
-        ppl = math.exp(sum(nlls) / len(nlls))
+        del cache; torch.cuda.empty_cache(); gc.collect()
+        return math.exp(sum(nlls) / len(nlls))
+
+    # FP16 baseline (same autoregressive eval, same token range)
+    ppl_fp16 = _ar_eval()
+    results = [('FP16', ppl_fp16, 0, 0)]
+
+    for bits in bits_list:
+        _patch, _orig, comps, pf_done = make_patcher(bits)
+        ppl = _ar_eval(patch_fn=_patch, orig_fn=_orig)
+        comps.clear(); pf_done.clear()
         delta = ppl - ppl_fp16
         pct = delta / ppl_fp16 * 100
         results.append((f'RQ {bits}-bit', ppl, delta, pct))
