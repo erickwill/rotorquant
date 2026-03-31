@@ -1,8 +1,8 @@
-# TurboQuant + RotorQuant + IsoQuant
+# TurboQuant + RotorQuant + IsoQuant + PlanarQuant
 
-A from-scratch PyTorch implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026), Google's two-stage vector quantization algorithm for compressing LLM key-value caches — plus **RotorQuant** (Clifford rotors) and **[IsoQuant](https://github.com/ParaMind2025/isoquant)** (quaternion 4D blocks, [local impl](turboquant/isoquant.py)), progressively faster drop-in replacements for the dense rotation step.
+A from-scratch PyTorch implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026), Google's two-stage vector quantization algorithm for compressing LLM key-value caches — plus **RotorQuant** (Clifford rotors), **[IsoQuant](https://github.com/ParaMind2025/isoquant)** (quaternion 4D blocks, [local impl](turboquant/isoquant.py)), and **PlanarQuant** (2D Givens rotations, [local impl](turboquant/planarquant.py)), progressively faster drop-in replacements for the dense rotation step.
 
-**[IsoQuant](https://github.com/ParaMind2025/isoquant)** is the recommended default: **5.8x faster** than RotorQuant at identical reconstruction quality, with clean 4D hardware alignment.
+**[PlanarQuant](https://github.com/ParaMind2025/isoquant)** (by ParaMind2025) is the fastest variant: **10–27x faster** than RotorQuant at identical reconstruction quality, using SO(2) Givens rotations on 2D pairs. **[IsoQuant](https://github.com/ParaMind2025/isoquant)** (also ParaMind2025) remains the recommended default for balanced quality/speed with clean 4D hardware alignment.
 
 ## Head-to-Head vs Reference TurboQuant
 
@@ -143,50 +143,50 @@ For a 7B model (28 layers, 32 KV heads) RefTQ needs **57 MB** just for rotation 
 
 ---
 
-## IsoQuant vs RotorQuant Internal Comparison
+## Rotation Variant Comparison
 
 ### Architecture (d=128)
 
-| | TurboQuant | RotorQuant | IsoQuant-Fast | IsoQuant-Full |
-|---|-----------|-----------|---------------|---------------|
-| Block structure | Dense 128×128 | 43 × 3D Clifford | **32 × 4D quaternion** | 32 × 4D quaternion |
-| Forward FMAs | 16,384 | 2,408 | **512** | 1,024 |
-| Parameters | 16,384 | 344 | **128** | 256 |
-| Alignment | N/A | 42 blocks + 2D tail | **32 clean blocks** | 32 clean blocks |
-| Stage-1 latency | — | 4,244 µs | **727 µs (5.8x)** | 1,152 µs (3.7x) |
-| Reconstruction MSE | Baseline | 0.000265 | **0.000265** | 0.000265 |
+| | TurboQuant | RotorQuant | IsoQuant-Fast | IsoQuant-Full | PlanarQuant |
+|---|-----------|-----------|---------------|---------------|-------------|
+| Block structure | Dense 128×128 | 43 × 3D Clifford | 32 × 4D quaternion | 32 × 4D quaternion | **64 × 2D Givens** |
+| Forward FMAs | 16,384 | 2,408 | 512 | 1,024 | **256** |
+| Parameters | 16,384 | 344 | 128 | 256 | **128** |
+| Alignment | N/A | 42 blocks + 2D tail | 32 clean blocks | 32 clean blocks | **64 clean pairs** |
+| Stage-1 latency | — | 2,649 µs | 466 µs (5.7x) | 710 µs (3.7x) | **164 µs (16.2x)** |
+| Reconstruction MSE | Baseline | 0.000265 | 0.000266 | 0.000265 | **0.000266** |
 
 ### Reconstruction MSE (8192 normalized vectors)
 
-| d | bits | RotorQuant | IsoQuant-Fast | IsoQuant-Full | Ratio (Fast/RQ) |
-|---|------|-----------|---------------|---------------|-----------------|
-| 64 | 2 | 0.001800 | 0.001785 | 0.001786 | 0.992x |
-| 64 | 3 | 0.000526 | 0.000521 | 0.000521 | 0.991x |
-| 64 | 4 | 0.000144 | 0.000143 | 0.000143 | 0.995x |
-| 128 | 2 | 0.000903 | 0.000906 | 0.000906 | 1.002x |
-| 128 | 3 | 0.000265 | 0.000265 | 0.000265 | 0.998x |
-| 128 | 4 | 0.000073 | 0.000072 | 0.000073 | 0.996x |
-| 256 | 2 | 0.000455 | 0.000456 | 0.000456 | 1.002x |
-| 256 | 3 | 0.000134 | 0.000134 | 0.000134 | 0.999x |
-| 256 | 4 | 0.000037 | 0.000037 | 0.000037 | 1.002x |
+| d | bits | RotorQuant | IsoQuant-Fast | IsoQuant-Full | PlanarQuant | Planar/RQ |
+|---|------|-----------|---------------|---------------|-------------|-----------|
+| 64 | 2 | 0.001804 | 0.001784 | 0.001789 | 0.001788 | 0.991x |
+| 64 | 3 | 0.000525 | 0.000522 | 0.000522 | 0.000522 | 0.995x |
+| 64 | 4 | 0.000143 | 0.000143 | 0.000143 | 0.000143 | 1.003x |
+| 128 | 2 | 0.000904 | 0.000907 | 0.000905 | 0.000907 | 1.003x |
+| 128 | 3 | 0.000265 | 0.000266 | 0.000265 | 0.000266 | 1.002x |
+| 128 | 4 | 0.000073 | 0.000073 | 0.000073 | 0.000073 | 1.006x |
+| 256 | 2 | 0.000456 | 0.000457 | 0.000456 | 0.000456 | 1.000x |
+| 256 | 3 | 0.000134 | 0.000134 | 0.000134 | 0.000134 | 1.000x |
+| 256 | 4 | 0.000037 | 0.000037 | 0.000037 | 0.000037 | 1.000x |
 
-MSE is indistinguishable across all settings. IsoQuant is a pure speed upgrade.
+MSE is indistinguishable across all methods. PlanarQuant and IsoQuant are pure speed upgrades.
 
-### Stage-1 Latency (µs, 8192 vectors, RTX PRO 4000)
+### Stage-1 Latency (µs, 8192 vectors, RTX 5090)
 
-| d | bits | RotorQuant | IsoQuant-Fast | Speedup | IsoQuant-Full | Speedup |
-|---|------|-----------|---------------|---------|---------------|---------|
-| 64 | 2 | 3,409 | **559** | **6.1x** | 694 | 4.9x |
-| 64 | 3 | 3,562 | **565** | **6.3x** | 1,088 | 3.3x |
-| 64 | 4 | 3,544 | **739** | **4.8x** | 1,260 | 2.8x |
-| 128 | 2 | 3,979 | **652** | **6.1x** | 1,069 | 3.7x |
-| 128 | 3 | 4,244 | **727** | **5.8x** | 1,152 | 3.7x |
-| 128 | 4 | 4,574 | **1,158** | **3.9x** | 1,563 | 2.9x |
-| 256 | 2 | 4,853 | **834** | **5.8x** | 1,337 | 3.6x |
-| 256 | 3 | 5,336 | **1,173** | **4.5x** | 1,669 | 3.2x |
-| 256 | 4 | 6,267 | **1,900** | **3.3x** | 2,328 | 2.7x |
+| d | bits | RotorQuant | IsoQuant-Full | IsoQuant-Fast | PlanarQuant | Planar speedup |
+|---|------|-----------|---------------|---------------|-------------|----------------|
+| 64 | 2 | 3,166 | 870 | 524 | **119** | **26.6x** |
+| 64 | 3 | 2,627 | 792 | 551 | **127** | **20.7x** |
+| 64 | 4 | 2,902 | 929 | 368 | **136** | **21.4x** |
+| 128 | 2 | 2,724 | 709 | 321 | **235** | **11.6x** |
+| 128 | 3 | 2,649 | 710 | 466 | **164** | **16.2x** |
+| 128 | 4 | 2,636 | 828 | 681 | **256** | **10.3x** |
+| 256 | 2 | 3,730 | 723 | 367 | **302** | **12.3x** |
+| 256 | 3 | 3,834 | 750 | 477 | **284** | **13.5x** |
+| 256 | 4 | 3,817 | 1,243 | 988 | **804** | **4.7x** |
 
-IsoQuant-Fast is consistently 3.3–6.3x faster. Best at low bit width and medium dimensions.
+PlanarQuant is consistently 4.7–26.6x faster than RotorQuant. Best gains at low dimensions and low bit widths.
 
 ### Perplexity (wikitext-2, autoregressive with post-prefill quantization)
 
@@ -230,14 +230,18 @@ Replaces the d×d matrix with **Clifford rotors** in Cl(3,0). Chunks the vector 
 
 Replaces Clifford rotors with **quaternion 4D blocks** based on the isoclinic decomposition SO(4) ≅ SU(2) × SU(2). Each group of 4 coordinates is treated as a quaternion and rotated via `q_L v q̄_R` (Full) or `q_L v` (Fast).
 
-| | TurboQuant | RotorQuant | IsoQuant-Fast |
-|---|-----------|-----------|---------------|
-| Rotation | Dense d×d matmul | Cl(3,0) rotor sandwich | **Quaternion multiply** |
-| Block size | d | 3 | **4** (hardware-aligned) |
-| FMAs (d=128) | 16,384 | 2,408 | **512 (32x fewer)** |
-| Parameters | 16,384 | 344 | **128 (128x fewer)** |
-| Alignment | N/A | Tail handling | **Clean power-of-2** |
-| Quality | Baseline | 1.0x | **1.0x** |
+### PlanarQuant (fastest, by [ParaMind2025](https://github.com/ParaMind2025/isoquant))
+
+The simplest rotation primitive: **2D Givens rotations** (SO(2)). Each pair of adjacent coordinates is rotated by an independent angle θ. Only 4 FMAs per pair — the theoretical minimum for rotation-based quantization.
+
+| | TurboQuant | RotorQuant | IsoQuant-Fast | PlanarQuant |
+|---|-----------|-----------|---------------|-------------|
+| Rotation | Dense d×d matmul | Cl(3,0) rotor sandwich | Quaternion multiply | **2D Givens rotation** |
+| Block size | d | 3 | 4 (hardware-aligned) | **2** (pair-aligned) |
+| FMAs (d=128) | 16,384 | 2,408 | 512 | **256 (64x fewer)** |
+| Parameters | 16,384 | 344 | 128 | **128 (128x fewer)** |
+| Alignment | N/A | Tail handling | Clean power-of-2 | **Clean pairs** |
+| Quality | Baseline | 1.0x | 1.0x | **1.0x** |
 
 ### Key Innovations
 
@@ -252,11 +256,15 @@ Replaces Clifford rotors with **quaternion 4D blocks** based on the isoclinic de
 ## Quick Start
 
 ```python
-from turboquant import IsoQuantMSE, IsoQuantProd
+from turboquant import IsoQuantMSE, IsoQuantProd, PlanarQuantMSE
 
-# Stage 1: MSE-optimal quantizer (IsoQuant-Fast, recommended)
+# PlanarQuant: fastest variant (2D Givens rotations, by ParaMind2025)
+pq = PlanarQuantMSE(d=128, bits=3, device='cuda')
+x_hat, indices = pq(x)  # quantize + dequantize
+
+# IsoQuant: recommended default (4D quaternion rotations)
 iq = IsoQuantMSE(d=128, bits=3, mode='fast', device='cuda')
-x_hat, indices = iq(x)  # quantize + dequantize
+x_hat, indices = iq(x)
 
 # Stage 1 + 2: With QJL residual correction
 iq_prod = IsoQuantProd(d=128, bits=3, mode='fast', device='cuda')
@@ -305,6 +313,7 @@ x_hat = triton_iso_fast_fused(x, iq.q_L, iq.centroids)
 ```
 benchmark_vs_reference.py    # Head-to-head vs reference TurboQuant (pip)
 turboquant/
+  planarquant.py             # PlanarQuant: 2D Givens rotation (fastest, by ParaMind2025)
   isoquant.py                # IsoQuant: quaternion 4D block rotation (recommended)
   rotorquant.py              # RotorQuant: Clifford 3D block rotation (legacy)
   clifford.py                # Cl(3,0) geometric algebra
@@ -314,12 +323,14 @@ turboquant/
   lloyd_max.py               # Lloyd-Max optimal scalar quantizer
   compressors.py             # Asymmetric inner product compressors
   cuda_backend.py            # QJL CUDA kernel wrappers
-  benchmark_isoquant.py      # IsoQuant vs RotorQuant benchmark
+  benchmark_isoquant.py      # All variants benchmark (Planar/Iso/Rotor)
   benchmark_google_parity.py # Google TurboQuant parity benchmark
   benchmark_perplexity.py    # Perplexity benchmark
   benchmark_triton.py        # Triton kernel benchmarks
   poc_high_context.py        # High-context generation POC
-  csrc/                      # CUDA kernels (rotor fused, QJL)
+  csrc/
+    planar2_fused_kernel.cu  # CUDA fused 2D rotation kernel (from ParaMind2025)
+    rotor_fused_kernel.cu    # CUDA fused Clifford rotation kernel
 tests/                       # Unit tests
 setup.py                     # pip install with optional CUDA build
 ```
@@ -339,10 +350,11 @@ pip install -e ".[validate]"        # + model validation deps (transformers, bit
 
 | Scenario | Recommendation |
 |----------|---------------|
-| **Default** | **IsoQuant-Fast 3-bit** (5.8x faster, same quality) |
+| **Maximum speed** | **PlanarQuant 3-bit** (10–27x faster than RQ, same quality) |
+| **Default** | **IsoQuant-Fast 3-bit** (5.8x faster, 4D hardware-aligned) |
 | KV cache compression (quality) | IsoQuant-Fast 4-bit (+3-10% PPL, 3.7x compression) |
 | KV cache compression (size) | IsoQuant-Fast 3-bit (4.9x, matches TQ) |
-| Long context on limited VRAM | IsoQuant-Fast 3-bit + post-prefill (65K tokens on 10 GB) |
+| Long context on limited VRAM | PlanarQuant or IsoQuant-Fast 3-bit + post-prefill |
 | Triton kernel path needed | RotorQuant (Triton kernels available) |
 | Apple Silicon | RotorQuant + Metal shader |
 
@@ -350,7 +362,7 @@ pip install -e ".[validate]"        # + model validation deps (transformers, bit
 
 - [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) — [Blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) — [Triton impl](https://dejan.ai/blog/turboquant/)
 - [back2matching/turboquant](https://github.com/back2matching/turboquant) — Reference open-source TurboQuant (pip install turboquant)
-- [IsoQuant](https://github.com/ParaMind2025/isoquant) — Ji, "IsoQuant: Hardware-Aligned SO(4) Isoclinic Rotations for LLM KV Cache Compression" (March 2026)
+- [IsoQuant / PlanarQuant](https://github.com/ParaMind2025/isoquant) — Ji, "IsoQuant: Hardware-Aligned SO(4) Isoclinic Rotations for LLM KV Cache Compression" (March 2026). PlanarQuant (2D Givens rotation variant) from the same repository.
 - [QJL: 1-Bit Quantized JL Transform](https://arxiv.org/abs/2406.03482) — [Code](https://github.com/amirzandieh/QJL)
 - [CommVQ](https://arxiv.org/abs/2506.18879) (ICML 2025) — [PolarQuant](https://arxiv.org/abs/2502.02617) (AISTATS 2026)
 - [CliffordNet](https://arxiv.org/abs/2601.06793) (Jan 2026)

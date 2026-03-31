@@ -20,6 +20,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from turboquant.rotorquant import RotorQuantMSE, RotorQuantProd
 from turboquant.isoquant import IsoQuantMSE, IsoQuantProd
+from turboquant.planarquant import PlanarQuantMSE, PlanarQuantProd
 
 
 def benchmark_mse(d, bits, n_vectors=8192, device='cuda'):
@@ -49,6 +50,12 @@ def benchmark_mse(d, bits, n_vectors=8192, device='cuda'):
     mse_fast = (x - x_hat_fast).pow(2).mean().item()
     results['IsoQuant-Fast'] = mse_fast
 
+    # PlanarQuant (2D Givens rotation)
+    pq = PlanarQuantMSE(d, bits, seed=42, device=device)
+    x_hat_pq, _ = pq(x)
+    mse_pq = (x - x_hat_pq).pow(2).mean().item()
+    results['PlanarQuant'] = mse_pq
+
     return results
 
 
@@ -62,6 +69,7 @@ def benchmark_speed(d, bits, n_vectors=8192, warmup=50, iters=200, device='cuda'
         'RotorQuant': RotorQuantMSE(d, bits, seed=42, device=device),
         'IsoQuant-Full': IsoQuantMSE(d, bits, seed=42, mode='full', device=device),
         'IsoQuant-Fast': IsoQuantMSE(d, bits, seed=42, mode='fast', device=device),
+        'PlanarQuant': PlanarQuantMSE(d, bits, seed=42, device=device),
     }
 
     results = {}
@@ -87,6 +95,7 @@ def benchmark_params(d, bits):
     rq = RotorQuantMSE(d, bits, seed=42, device='cpu')
     iq_full = IsoQuantMSE(d, bits, seed=42, mode='full', device='cpu')
     iq_fast = IsoQuantMSE(d, bits, seed=42, mode='fast', device='cpu')
+    pq = PlanarQuantMSE(d, bits, seed=42, device='cpu')
 
     return {
         'RotorQuant': {
@@ -110,6 +119,13 @@ def benchmark_params(d, bits):
             'rotation_params': iq_fast.q_L.numel(),
             'quantized_per_group': 4,
         },
+        'PlanarQuant': {
+            'n_groups': pq.n_groups,
+            'block_size': 2,
+            'components': 2,
+            'rotation_params': pq.rot2.numel(),  # n_groups * 2 (cos, sin)
+            'quantized_per_group': 2,
+        },
     }
 
 
@@ -126,6 +142,7 @@ def benchmark_inner_product(d, bits, n_vectors=4096, device='cuda'):
         'RotorQuant': RotorQuantProd(d, bits, seed=42, device=device),
         'IsoQuant-Full': IsoQuantProd(d, bits, mode='full', seed=42, device=device),
         'IsoQuant-Fast': IsoQuantProd(d, bits, mode='fast', seed=42, device=device),
+        'PlanarQuant': PlanarQuantProd(d, bits, seed=42, device=device),
     }
 
     results = {}
@@ -151,18 +168,19 @@ if __name__ == '__main__':
     print("=" * 70)
     print("  RECONSTRUCTION MSE (lower is better)")
     print("=" * 70)
-    print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} | {'Full vs RQ':>10} {'Fast vs RQ':>10}")
-    print("-" * 70)
+    print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} {'Planar2D':>12} | {'Full/RQ':>8} {'Fast/RQ':>8} {'2D/RQ':>8}")
+    print("-" * 90)
     for d in dims:
         for bits in bits_list:
             mses = benchmark_mse(d, bits, device=device)
             rq = mses['RotorQuant']
             full = mses['IsoQuant-Full']
             fast = mses['IsoQuant-Fast']
-            # Ratio: <1 means IsoQuant is better
+            pq = mses['PlanarQuant']
             r_full = full / rq if rq > 0 else float('inf')
             r_fast = fast / rq if rq > 0 else float('inf')
-            print(f"{d:>5} {bits:>4} | {rq:>12.6f} {full:>12.6f} {fast:>12.6f} | {r_full:>9.3f}x {r_fast:>9.3f}x")
+            r_pq = pq / rq if rq > 0 else float('inf')
+            print(f"{d:>5} {bits:>4} | {rq:>12.6f} {full:>12.6f} {fast:>12.6f} {pq:>12.6f} | {r_full:>7.3f}x {r_fast:>7.3f}x {r_pq:>7.3f}x")
 
     # ── Speed Benchmark ──
     if device == 'cuda':
@@ -170,15 +188,16 @@ if __name__ == '__main__':
         print("=" * 70)
         print("  LATENCY (microseconds, lower is better)")
         print("=" * 70)
-        print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} | {'Full speedup':>12} {'Fast speedup':>12}")
-        print("-" * 70)
+        print(f"{'d':>5} {'bits':>4} | {'RotorQuant':>12} {'IsoFull':>12} {'IsoFast':>12} {'Planar2D':>12} | {'Full':>6} {'Fast':>6} {'2D':>6}")
+        print("-" * 90)
         for d in dims:
             for bits in bits_list:
                 speeds = benchmark_speed(d, bits, device=device)
                 rq = speeds['RotorQuant']
                 full = speeds['IsoQuant-Full']
                 fast = speeds['IsoQuant-Fast']
-                print(f"{d:>5} {bits:>4} | {rq:>10.0f}µs {full:>10.0f}µs {fast:>10.0f}µs | {rq/full:>11.2f}x {rq/fast:>11.2f}x")
+                pq = speeds['PlanarQuant']
+                print(f"{d:>5} {bits:>4} | {rq:>10.0f}µs {full:>10.0f}µs {fast:>10.0f}µs {pq:>10.0f}µs | {rq/full:>5.1f}x {rq/fast:>5.1f}x {rq/pq:>5.1f}x")
 
     # ── Parameter Count ──
     print()
@@ -196,15 +215,16 @@ if __name__ == '__main__':
     print("=" * 70)
     print("  INNER PRODUCT ESTIMATION (Stage 1 + Stage 2)")
     print("=" * 70)
-    print(f"{'d':>5} {'bits':>4} | {'RQ ip_mse':>12} {'Full ip_mse':>12} {'Fast ip_mse':>12} | {'RQ bias':>10} {'Full bias':>10} {'Fast bias':>10}")
-    print("-" * 70)
+    print(f"{'d':>5} {'bits':>4} | {'RQ ip_mse':>12} {'Full ip_mse':>12} {'Fast ip_mse':>12} {'2D ip_mse':>12} | {'RQ bias':>10} {'Full bias':>10} {'Fast bias':>10} {'2D bias':>10}")
+    print("-" * 110)
     for d in dims:
         for bits in bits_list:
             ips = benchmark_inner_product(d, bits, device=device)
             rq = ips['RotorQuant']
             full = ips['IsoQuant-Full']
             fast = ips['IsoQuant-Fast']
-            print(f"{d:>5} {bits:>4} | {rq['ip_mse']:>12.6f} {full['ip_mse']:>12.6f} {fast['ip_mse']:>12.6f} | {rq['ip_bias']:>+10.6f} {full['ip_bias']:>+10.6f} {fast['ip_bias']:>+10.6f}")
+            pq = ips['PlanarQuant']
+            print(f"{d:>5} {bits:>4} | {rq['ip_mse']:>12.6f} {full['ip_mse']:>12.6f} {fast['ip_mse']:>12.6f} {pq['ip_mse']:>12.6f} | {rq['ip_bias']:>+10.6f} {full['ip_bias']:>+10.6f} {fast['ip_bias']:>+10.6f} {pq['ip_bias']:>+10.6f}")
 
     print()
     print("=" * 70)
