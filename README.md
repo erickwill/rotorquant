@@ -205,28 +205,38 @@ PlanarQuant PyTorch is 4.7–26.6x faster than RotorQuant. Best gains at low dim
 
 With Triton, both PlanarQuant and IsoQuant converge to **~30µs** — the memory-bound floor. The FMA difference (4 vs 16) is invisible at this scale. Without Triton, PlanarQuant's simpler PyTorch path gives 2–5x over IsoQuant.
 
-### Perplexity (wikitext-2, autoregressive with post-prefill quantization)
+### Perplexity — Post-Prefill (wikitext-2, Qwen2.5-3B, CUDA/Triton, RTX 5090)
 
-| Model | KV Heads | FP16 PPL | RQ 4-bit | Delta | RQ 3-bit | Delta |
-|-------|----------|---------|---------|-------|---------|-------|
-| **Mistral-7B** | 8 | 4.80 | **5.16** | **+7.4%** | 5.53 | +15.3% |
-| **Gemma-2-2b** | 4 | 8.87 | **9.77** | **+10.1%** | 10.64 | +19.9% |
-| Qwen2.5-3B | 2 | 9.81 | **10.13** | **+3.2%** | 12.28 | +25.2% |
+Post-prefill: prefill at full FP16, then bulk-quantize KV cache for decode. This is the realistic inference strategy — no error compounding through layers during prefill.
 
-### Perplexity — CUDA/Triton Roundtrip (wikitext-2, Qwen2.5-3B, RTX 5090)
+| Method | 3-bit PPL | 4-bit PPL | 3-bit vs FP16 | 4-bit vs FP16 |
+|--------|-----------|-----------|---------------|---------------|
+| **FP16** | **7.59** | **7.59** | baseline | baseline |
+| **IsoQuant-Fast** | 12.35 | **9.03** | +62.7% | **+19.0%** |
+| **PlanarQuant** | **10.12** | 9.56 | **+33.3%** | +26.0% |
+| RotorQuant | 12.22 | 10.03 | +61.0% | +32.1% |
 
-Roundtrip test: keys quantized during forward pass (worst case — compounding errors through layers).
+IsoQuant 4-bit at **PPL 9.03 (+19%)** is production-usable. PlanarQuant is best at 3-bit (**PPL 10.12**) despite having the simplest rotation — fewer elements per rotation group means less quantization error per component.
+
+Reproduce:
+```bash
+# Post-prefill PPL (autoregressive, 512 tokens, 256 prefill)
+python -m turboquant.benchmark_google_parity --model Qwen/Qwen2.5-3B-Instruct --bits 3 4
+
+# Roundtrip PPL (worst case — keys quantized during forward pass)
+python -m turboquant.benchmark_perplexity --bits 3 4 --backends isoquant planarquant rotorquant
+```
+
+### Perplexity — Roundtrip (wikitext-2, Qwen2.5-3B, CUDA/Triton)
+
+Roundtrip: keys quantized during every forward pass chunk. Worst case — measures compounding error through layers. All methods degrade significantly vs post-prefill.
 
 | Method | 3-bit PPL | 4-bit PPL |
 |--------|-----------|-----------|
 | **FP16** | **7.98** | **7.98** |
-| **PlanarQuant** | 67.21 | **25.17** |
 | **IsoQuant-Fast** | **37.51** | 27.66 |
+| **PlanarQuant** | 67.21 | **25.17** |
 | RotorQuant | 102.93 | 149.16 |
-
-IsoQuant-Fast is best at 3-bit (PPL 37.51). PlanarQuant is best at 4-bit (PPL 25.17). RotorQuant's Clifford 3D blocks underperform because they only mix 3 elements per group (vs 4 for IsoQuant, 2 for PlanarQuant — but PlanarQuant compensates with more groups).
-
-**Note on Mac Metal PPL**: The llama.cpp Metal results (iso3 PPL 70-155) are worse than CUDA/Triton (iso3 PPL 37.51) because the Metal implementation uses a hand-rolled LCG PRNG that produces different rotation constants than Python's `torch.randn`. The CUDA/Triton path uses the exact same rotation parameters as the Python implementation, giving correct results. The Metal constants need to be regenerated from the Python source to match.
 
 ### High-Context Generation
 
@@ -387,86 +397,13 @@ pip install -e ".[validate]"        # + model validation deps (transformers, bit
 
 | Scenario | Recommendation |
 |----------|---------------|
-| **Maximum speed** | **PlanarQuant 3-bit** (10–27x faster than RQ, same quality) |
-| **Default** | **IsoQuant-Fast 3-bit** (5.8x faster, 4D hardware-aligned) |
-| KV cache compression (quality) | IsoQuant-Fast 4-bit (+3-10% PPL, 3.7x compression) |
-| KV cache compression (size) | IsoQuant-Fast 3-bit (4.9x, matches TQ) |
+| **Best quality (4-bit)** | **IsoQuant-Fast 4-bit** (PPL 9.03, +19% over FP16) |
+| **Best quality (3-bit)** | **PlanarQuant 3-bit** (PPL 10.12, +33% over FP16) |
+| **Maximum speed** | **PlanarQuant 3-bit** (10–27x faster than RQ in PyTorch) |
+| **Default** | **IsoQuant-Fast 4-bit** (best PPL, 4D hardware-aligned) |
 | Long context on limited VRAM | PlanarQuant or IsoQuant-Fast 3-bit + post-prefill |
-| Triton kernel path needed | RotorQuant (Triton kernels available) |
-| Apple Silicon (llama.cpp) | **PlanarQuant `--cache-type-k planar3`** (see below) |
-
-## llama.cpp Metal Integration (Apple Silicon)
-
-PlanarQuant and IsoQuant are available as native KV cache types in our [llama.cpp fork](https://github.com/johndpope/llama-cpp-turboquant/tree/feature/planarquant-kv-cache), built on [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant). Three new cache types: `iso3` (recommended), `planar3`, alongside existing `turbo3`/`turbo4`.
-
-### Build
-
-```bash
-git clone https://github.com/johndpope/llama-cpp-turboquant.git
-cd llama-cpp-turboquant
-git checkout feature/planarquant-kv-cache
-
-cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-### Run
-
-```bash
-# Benchmark (iso3 recommended)
-./build/bin/llama-bench -m model.gguf -ngl 99 -ctk iso3 -ctv iso3 -fa 1 -p 512,2048,8192 -n 64
-
-# Inference
-./build/bin/llama-server -m model.gguf --jinja -ngl 99 -fa on \
-    --cache-type-k iso3 --cache-type-v iso3 --host 0.0.0.0 --port 8080
-
-# Perplexity (pip install datasets if needed)
-python3 -c "from datasets import load_dataset; ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test'); open('/tmp/wikitext-2-raw-test.txt','w').write('\n'.join(ds['text']))"
-./build/bin/llama-perplexity -m model.gguf -f /tmp/wikitext-2-raw-test.txt \
-    -ngl 99 -c 512 --chunks 20 -fa 1 --cache-type-k iso3 --cache-type-v iso3
-```
-
-### Perplexity (wikitext-2-raw, 512 ctx, 20 chunks)
-
-**Qwen2.5-3B Q4_K_M** (2 KV heads — hardest case):
-
-| Cache | PPL | vs FP16 | Decode tok/s | vs FP16 speed |
-|-------|-----|---------|-------------|---------------|
-| **FP16** | **9.98** | baseline | **47.4** | 100% |
-| **iso3** | **70.2** | +60 | **39.2** | **83%** |
-| turbo3 | 180.3 | +170 | 33.9 | 72% |
-| planar3 | 2143.6 | catastrophic | 40.8 | 86% |
-
-**Qwen2.5-7B Q3_K_M** (stress test — turbo3 known to blow up):
-
-| Cache | PPL | vs FP16 |
-|-------|-----|---------|
-| **FP16** | **8.12** | baseline |
-| **iso3** | **153.5** | +145 |
-| planar3 | 141.6 | +134 |
-| turbo3 | **6564.6** | **catastrophic** |
-
-IsoQuant (iso3) is **2.6x better PPL than turbo3** on 3B and **43x better on 7B**. The quaternion 4D rotation provides much better decorrelation than WHT for low-KV-head models. turbo3 collapses catastrophically on 7B (PPL 6565) while iso3 stays at 153.
-
-### Speed (M4 Mac Mini 24GB, Qwen2.5-3B Q4_K_M)
-
-| Cache Type | pp512 | pp2K | Decode (tg64) | vs FP16 decode |
-|-----------|-------|------|---------------|----------------|
-| **FP16** | **518** | **459** | **47.4 tok/s** | 100% |
-| **iso3** | 500 | 418 | **39.2 tok/s** | **83%** |
-| planar3 | 525 | 443 | 40.8 tok/s | 86% |
-| turbo3 | 387 | 446 | 33.9 tok/s | 72% |
-
-All cache types coexist — turbo2/3/4, planar3, and iso3 work side by side.
-
-### How it works
-
-Three rotation strategies implemented as Metal shaders:
-- **IsoQuant** (`iso3`): quaternion 4D block rotation — 16 FMAs/group, 32 groups for d=128. Best quality.
-- **PlanarQuant** (`planar3`): 2D Givens rotation — 4 FMAs/pair, 64 pairs. Fastest decode.
-- **TurboQuant** (`turbo3`): Walsh-Hadamard Transform — O(d log d) global mixing. Original.
-
-Each implements: `kernel_set_rows_*` (quantize with forward rotation), `dequantize_*_0` (non-vec FA), `dequantize_*_0_t4` (vec FA for decode).
+| Triton kernel path needed | All three have Triton kernels (~30µs) |
+| Apple Silicon (llama.cpp) | See [llama.cpp fork](https://github.com/johndpope/llama-cpp-turboquant/tree/feature/planarquant-kv-cache) (WIP — Metal PRNG needs alignment with Python constants) |
 
 ## References
 
