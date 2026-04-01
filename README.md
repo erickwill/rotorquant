@@ -32,13 +32,13 @@ The butterfly bypass from the [RotorQuant paper](https://www.scrya.com/rotorquan
 
 The original [RotorQuant paper](https://www.scrya.com/rotorquant.pdf) proposed Clifford algebra Cl(3,0) rotors — the rotor sandwich product RxR̃ with only 4 non-zero multivector components. The insight: you don't need a full-rank d×d transform to decorrelate KV cache vectors; small orthogonal blocks suffice because real attention vectors live on low-rank manifolds.
 
-This led to three progressively simpler implementations:
+This led to three progressively simpler implementations. **PlanarQuant** (2D Givens) and **IsoQuant** (4D quaternion) were developed by [@ParaMind2025](https://github.com/ParaMind2025/isoquant), building on the block-diagonal rotation idea:
 
 | Method | Rotation | Group Size | FMAs (d=128) | Params | Status |
 |---|---|---:|---:|---:|---|
 | **RotorQuant** | Cl(3,0) rotor sandwich | 3 | ~2,400 | 372 | Research (Triton) |
-| **IsoQuant** | Quaternion 4D | 4 | 512 | 128 | **Production (llama.cpp)** |
-| **PlanarQuant** | Givens 2D | 2 | 256 | 128 | **Production (llama.cpp)** |
+| **[IsoQuant](https://github.com/ParaMind2025/isoquant)** | Quaternion 4D | 4 | 512 | 128 | **Production (llama.cpp)** |
+| **[PlanarQuant](https://github.com/ParaMind2025/isoquant)** | Givens 2D | 2 | 256 | 128 | **Production (llama.cpp)** |
 | TurboQuant | WHT butterfly | 128 | 16,384 | 16,384 | Production (llama.cpp) |
 
 Each step traded algebraic richness for speed. The PPL results show the simpler rotations work *better* — confirming the paper's claim that block-diagonal rotation preserves the directional structure of KV cache vectors more effectively than global WHT scrambling.
@@ -182,11 +182,15 @@ python -m turboquant.benchmark_triton                  # Triton kernel speed
 python -m turboquant.poc_high_context --backend planar  # High-context generation
 ```
 
+## Acknowledgments
+
+**[ParaMind2025](https://github.com/ParaMind2025)** — PlanarQuant (2D Givens rotation) and IsoQuant (4D quaternion rotation) were designed by ParaMind2025. Their insight that simple block-diagonal rotations could match full-rank transforms for KV cache decorrelation made the llama.cpp integration practical.
+
 ## References
 
 - [RotorQuant paper](https://www.scrya.com/rotorquant.pdf) — Clifford algebra vector quantization for KV cache compression
 - [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) — Google's KV cache compression
-- [IsoQuant / PlanarQuant](https://github.com/ParaMind2025/isoquant) — ParaMind2025
+- [IsoQuant / PlanarQuant](https://github.com/ParaMind2025/isoquant) — ParaMind2025's rotation-based quantizers
 - [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) — llama.cpp fork with TurboQuant
 - [QJL](https://arxiv.org/abs/2406.03482) — 1-bit quantized JL transform
 
