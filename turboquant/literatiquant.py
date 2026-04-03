@@ -273,6 +273,207 @@ def quantize_literati_v3(w: torch.Tensor, group_size: int = 128,
     return w_q
 
 
+def quantize_ternary(w: torch.Tensor, group_size: int = 128,
+                     zero_thresh: float = 0.3) -> torch.Tensor:
+    """
+    Ternary quantization: {-s, 0, +s} with adaptive zero-band.
+
+    Elements within zero_thresh * scale of zero are mapped to 0.
+    ~1.58 bits/elem (log2(3) per element + scale overhead).
+    """
+    C = w.shape[-1]
+    G = group_size
+    pad = (G - C % G) % G
+    if pad > 0:
+        w = F.pad(w, (0, pad))
+    w_groups = w.reshape(*w.shape[:-1], -1, G)
+
+    # Compute scale from non-zero elements (avoid zero-dominated groups)
+    abs_vals = w_groups.abs()
+    scales = abs_vals.mean(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # Ternary assignment
+    normalized = w_groups / scales
+    ternary = torch.zeros_like(normalized)
+    ternary[normalized > zero_thresh] = 1.0
+    ternary[normalized < -zero_thresh] = -1.0
+
+    # Recompute optimal scale for non-zero positions only
+    nonzero_mask = ternary != 0
+    if nonzero_mask.any():
+        # s* = sum(|w_i| for nonzero) / count(nonzero)
+        nz_abs = (w_groups.abs() * nonzero_mask).sum(dim=-1, keepdim=True)
+        nz_count = nonzero_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        scales = nz_abs / nz_count
+
+    w_q = ternary * scales
+    w_q = w_q.reshape(*w_q.shape[:-2], -1)
+    if pad > 0:
+        w_q = w_q[..., :C]
+    return w_q
+
+
+def quantize_adaptive_clip_median(w: torch.Tensor, group_size: int = 128,
+                                   percentile: float = 0.95) -> torch.Tensor:
+    """
+    1-bit with adaptive clipping + median-based scale.
+
+    Median is more robust to outliers than mean. Clipping at 95th percentile
+    (more aggressive than v2's 99th) prevents extreme values from dominating.
+    """
+    C = w.shape[-1]
+    G = group_size
+    pad = (G - C % G) % G
+    if pad > 0:
+        w = F.pad(w, (0, pad))
+    w_groups = w.reshape(*w.shape[:-1], -1, G)
+
+    # Aggressive clipping
+    abs_vals = w_groups.abs().float()
+    clip_val = torch.quantile(abs_vals, percentile, dim=-1, keepdim=True)
+    w_clipped = w_groups.clamp(-clip_val, clip_val)
+
+    # Signs from clipped values
+    signs = torch.sign(w_clipped)
+    signs[signs == 0] = 1.0
+
+    # Median-based scale (robust to remaining outliers)
+    scales = torch.median(abs_vals.clamp(max=clip_val), dim=-1, keepdim=True).values
+    scales = scales.clamp(min=1e-8)
+
+    w_q = signs * scales
+    w_q = w_q.reshape(*w_q.shape[:-2], -1)
+    if pad > 0:
+        w_q = w_q[..., :C]
+    return w_q
+
+
+def quantize_hybrid_1_2bit(w: torch.Tensor, group_size: int = 128,
+                            var_percentile: float = 0.7) -> torch.Tensor:
+    """
+    Hybrid 1-bit / 2-bit per group: high-variance groups get 2-bit.
+
+    Groups with variance above the var_percentile threshold use 4-level
+    {-3s,-s,+s,+3s}, the rest use 1-bit sign*scale.
+    Average ~1.3-1.5 bits/elem depending on threshold.
+    """
+    C = w.shape[-1]
+    G = group_size
+    pad = (G - C % G) % G
+    if pad > 0:
+        w = F.pad(w, (0, pad))
+    w_groups = w.reshape(*w.shape[:-1], -1, G)  # (..., ng, G)
+
+    # Detect high-variance groups
+    group_var = w_groups.var(dim=-1)  # (..., ng)
+    threshold = torch.quantile(group_var.float().reshape(-1), var_percentile).item()
+    is_2bit = group_var > threshold
+
+    # 1-bit path: sign * mean_abs
+    abs_vals = w_groups.abs()
+    scales_1bit = abs_vals.mean(dim=-1, keepdim=True).clamp(min=1e-8)
+    signs = torch.sign(w_groups)
+    signs[signs == 0] = 1.0
+    w_q = signs * scales_1bit
+
+    # 2-bit path for outlier groups: {-3s, -s, +s, +3s}
+    if is_2bit.any():
+        scales_2bit = abs_vals.mean(dim=-1, keepdim=True) / 2.0
+        scales_2bit = scales_2bit.clamp(min=1e-8)
+        normalized = w_groups / scales_2bit
+        level_idx = torch.clamp(torch.round((normalized + 3) / 2), 0, 3)
+        level_vals = level_idx * 2 - 3  # {-3, -1, +1, +3}
+        w_q_2bit = level_vals * scales_2bit
+        # Apply 2-bit only to outlier groups
+        is_2bit_expanded = is_2bit.unsqueeze(-1).expand_as(w_q)
+        w_q = torch.where(is_2bit_expanded, w_q_2bit, w_q)
+
+    w_q = w_q.reshape(*w_q.shape[:-2], -1)
+    if pad > 0:
+        w_q = w_q[..., :C]
+    return w_q
+
+
+def quantize_per_head_norm(w: torch.Tensor, group_size: int = 128) -> torch.Tensor:
+    """
+    Per-head normalization before 1-bit quantization (OneBit-style).
+
+    Normalizes each head's KV vectors by the head's average magnitude
+    before applying sign quantization. This removes inter-head scale
+    differences that inflate group scales.
+
+    w: (batch*n_heads*seq, D) flattened KV cache vectors
+    """
+    C = w.shape[-1]
+    G = group_size
+
+    # Per-row normalization (each row = one head's one token)
+    row_norms = torch.norm(w, dim=-1, keepdim=True).clamp(min=1e-8)
+    w_norm = w / row_norms
+
+    # Standard 1-bit on normalized
+    pad = (G - C % G) % G
+    if pad > 0:
+        w_norm = F.pad(w_norm, (0, pad))
+    w_groups = w_norm.reshape(*w_norm.shape[:-1], -1, G)
+
+    signs = torch.sign(w_groups)
+    signs[signs == 0] = 1.0
+    scales = w_groups.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    w_q = signs * scales
+    w_q = w_q.reshape(*w_q.shape[:-2], -1)
+    if pad > 0:
+        w_q = w_q[..., :C]
+
+    # Denormalize
+    return w_q * row_norms
+
+
+# Temporal smoothing state (module-level for simplicity in benchmarks)
+_temporal_scales = {}
+
+def quantize_temporal_smooth(w: torch.Tensor, layer_id: int,
+                              group_size: int = 128,
+                              alpha: float = 0.3) -> torch.Tensor:
+    """
+    1-bit with temporal scale smoothing across tokens.
+
+    Uses exponential moving average of scales: s_t = alpha*s_new + (1-alpha)*s_prev.
+    This leverages the temporal stability of KV cache distributions.
+    """
+    C = w.shape[-1]
+    G = group_size
+    pad = (G - C % G) % G
+    if pad > 0:
+        w = F.pad(w, (0, pad))
+    w_groups = w.reshape(*w.shape[:-1], -1, G)
+
+    signs = torch.sign(w_groups)
+    signs[signs == 0] = 1.0
+
+    new_scales = w_groups.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    # EMA smoothing with previous token's scales
+    if layer_id in _temporal_scales:
+        prev = _temporal_scales[layer_id]
+        # Broadcast to match current batch shape
+        if prev.shape == new_scales.shape:
+            scales = alpha * new_scales + (1 - alpha) * prev
+        else:
+            scales = new_scales  # shape mismatch (first prefill vs decode)
+    else:
+        scales = new_scales
+
+    _temporal_scales[layer_id] = scales.detach().clone()
+
+    w_q = signs * scales
+    w_q = w_q.reshape(*w_q.shape[:-2], -1)
+    if pad > 0:
+        w_q = w_q[..., :C]
+    return w_q
+
+
 def compute_group_stats(w: torch.Tensor, group_size: int = 128):
     """Compute per-group mean and scale (for asymmetric mode)."""
     C = w.shape[-1]
